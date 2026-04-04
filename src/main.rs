@@ -1,218 +1,97 @@
-use chrono::Utc;
-use ed25519_dalek::{Keypair, PublicKey, Signature, Signer, Verifier};
-use rand::rngs::OsRng;
+mod error;
+mod merkle;
+mod transaction;
+mod blockchain;
+mod mempool;
+mod network;
+
+use anyhow::Result;
+use axum::{
+    extract::{Path, State},
+    routing::{get, post},
+    Json, Router,
+};
+use std::net::SocketAddr;
+use std::sync::{Arc, RwLock};
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::net::{TcpListener, TcpStream};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
-use std::fmt::Write;
 
-// ---------- Transaction ----------
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Transaction {
-    pub sender: String,      // base64 encoded public key
-    pub receiver: String,    // base64 encoded public key
-    pub amount: u64,
-    pub signature: String,   // hex encoded signature
+use crate::blockchain::{Blockchain, Block};
+
+use crate::transaction::Transaction;
+use crate::network::handle_p2p;
+
+
+// ---------- API Handlers ----------
+async fn get_blocks(State(state): State<Arc<RwLock<Blockchain>>>) -> Json<Vec<Block>> {
+    let bc = state.read().unwrap();
+    Json(bc.chain.clone())
 }
 
-impl Transaction {
-    pub fn new(sender: PublicKey, receiver: PublicKey, amount: u64, keypair: &Keypair) -> Self {
-        let tx_data = format!("{}{}{}", sender, receiver, amount);
-        let signature = keypair.sign(tx_data.as_bytes());
-        Transaction {
-            sender: base64_encode(sender.as_bytes()),
-            receiver: base64_encode(receiver.as_bytes()),
-            amount,
-            signature: hex::encode(signature.to_bytes()),
-        }
-    }
-
-    pub fn verify(&self) -> bool {
-        // Decode sender public key
-        let sender_bytes = match base64_decode(&self.sender) {
-            Ok(b) => b,
-            Err(_) => return false,
-        };
-        let sender_pk = match PublicKey::from_bytes(&sender_bytes) {
-            Ok(pk) => pk,
-            Err(_) => return false,
-        };
-        let tx_data = format!("{}{}{}", self.sender, self.receiver, self.amount);
-        let sig_bytes = match hex::decode(&self.signature) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        let signature = match Signature::from_bytes(&sig_bytes) {
-            Ok(s) => s,
-            Err(_) => return false,
-        };
-        sender_pk.verify(tx_data.as_bytes(), &signature).is_ok()
-    }
+async fn get_balance(
+    State(state): State<Arc<RwLock<Blockchain>>>,
+    Path(address): Path<String>,
+) -> Json<u64> {
+    let bc = state.read().unwrap();
+    Json(bc.get_balance(&address))
 }
 
-// ---------- Block ----------
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Block {
-    pub index: u64,
-    pub timestamp: i64,
-    pub transactions: Vec<Transaction>,
-    pub previous_hash: String,
-    pub nonce: u64,
-    pub hash: String,
+async fn submit_tx(
+    State(state): State<Arc<RwLock<Blockchain>>>,
+    Json(tx): Json<Transaction>,
+) -> Result<Json<String>, String> {
+    let mut bc = state.write().unwrap();
+    bc.add_to_mempool(tx)
+        .map(|_| Json("Transaction added to mempool".to_string()))
+        .map_err(|e| e.to_string())
 }
 
-impl Block {
-    pub fn new(index: u64, transactions: Vec<Transaction>, previous_hash: String) -> Self {
-        let timestamp = Utc::now().timestamp();
-        let mut block = Block {
-            index,
-            timestamp,
-            transactions,
-            previous_hash,
-            nonce: 0,
-            hash: String::new(),
-        };
-        block.mine_block();
-        block
-    }
-
-    pub fn calculate_hash(&self) -> String {
-        let data = format!(
-            "{}{}{:?}{}{}",
-            self.index, self.timestamp, self.transactions, self.previous_hash, self.nonce
-        );
-        let mut hasher = Sha256::new();
-        hasher.update(data.as_bytes());
-        let result = hasher.finalize();
-        hex::encode(result)
-    }
-
-    pub fn mine_block(&mut self) {
-        let target = "0000"; // 4 leading zeros difficulty
-        while !self.calculate_hash().starts_with(target) {
-            self.nonce += 1;
-        }
-        self.hash = self.calculate_hash();
-        println!("Block mined: {}", self.hash);
-    }
+async fn mine_block_api(
+    State(state): State<Arc<RwLock<Blockchain>>>,
+    Path(miner_address): Path<String>,
+) -> Result<Json<Block>, String> {
+    let mut bc = state.write().unwrap();
+    bc.mine_block_from_mempool(miner_address)
+        .map(Json)
+        .map_err(|e| e.to_string())
 }
 
-// ---------- Blockchain ----------
-pub struct Blockchain {
-    pub chain: Vec<Block>,
-    pub pending_transactions: Vec<Transaction>,
-    pub mining_reward: u64,
+async fn get_mempool(State(state): State<Arc<RwLock<Blockchain>>>) -> Json<Vec<Transaction>> {
+    let bc = state.read().unwrap();
+    Json(bc.mempool.transactions.values().cloned().collect())
 }
 
-impl Blockchain {
-    pub fn new() -> Self {
-        let genesis_block = Block::new(0, vec![], String::new());
-        Blockchain {
-            chain: vec![genesis_block],
-            pending_transactions: vec![],
-            mining_reward: 100,
-        }
-    }
+// ---------- Main ----------
+#[tokio::main]
+async fn main() -> Result<()> {
+    let blockchain = Blockchain::open("blockchain_db")?;
+    let shared_state = Arc::new(RwLock::new(blockchain));
 
-    pub fn add_transaction(&mut self, tx: Transaction) {
-        if tx.verify() {
-            self.pending_transactions.push(tx);
-            println!("Transaction added.");
-        } else {
-            println!("Invalid transaction – signature verification failed.");
-        }
-    }
-
-    pub fn mine_pending_transactions(&mut self, miner_address: &str) {
-        // Add mining reward transaction
-        let reward_tx = Transaction {
-            sender: "system".to_string(),
-            receiver: miner_address.to_string(),
-            amount: self.mining_reward,
-            signature: "".to_string(),
-        };
-        self.pending_transactions.push(reward_tx);
-
-        let new_block = Block::new(
-            self.chain.len() as u64,
-            self.pending_transactions.clone(),
-            self.chain.last().unwrap().hash.clone(),
-        );
-        self.chain.push(new_block);
-        self.pending_transactions.clear();
-    }
-
-    pub fn is_chain_valid(&self) -> bool {
-        for i in 1..self.chain.len() {
-            let current = &self.chain[i];
-            let previous = &self.chain[i - 1];
-
-            if current.hash != current.calculate_hash() {
-                return false;
-            }
-            if current.previous_hash != previous.hash {
-                return false;
-            }
-            // Verify all transactions in block
-            for tx in &current.transactions {
-                if !tx.verify() {
-                    return false;
-                }
+    let p2p_state = shared_state.clone();
+    tokio::spawn(async move {
+        let listener = TcpListener::bind("127.0.0.1:9000").await.unwrap();
+        println!("P2P Server listening on 127.0.0.1:9000");
+        loop {
+            if let Ok((stream, _)) = listener.accept().await {
+                let state = p2p_state.clone();
+                tokio::spawn(handle_p2p(stream, state));
             }
         }
-        true
-    }
+    });
 
-    pub fn get_balance(&self, address: &str) -> u64 {
-        let mut balance = 0;
-        for block in &self.chain {
-            for tx in &block.transactions {
-                if tx.sender == address {
-                    balance -= tx.amount;
-                }
-                if tx.receiver == address {
-                    balance += tx.amount;
-                }
-            }
-        }
-        balance
-    }
-}
+    let app = Router::new()
+        .route("/blocks", get(get_blocks))
+        .route("/balance/:address", get(get_balance))
+        .route("/transactions", post(submit_tx))
+        .route("/mine/:miner_address", post(mine_block_api))
+        .route("/mempool", get(get_mempool))
+        .with_state(shared_state);
 
-// ---------- Helper functions ----------
-fn base64_encode(data: &[u8]) -> String {
-    base64::encode(data)
-}
+    let addr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    println!("REST API listening on {}", addr);
+    let listener = tokio::net::TcpListener::bind(addr).await?;
+    axum::serve(listener, app).await?;
 
-fn base64_decode(data: &str) -> Result<Vec<u8>, base64::DecodeError> {
-    base64::decode(data)
-}
-
-// ---------- Main (CLI) ----------
-fn main() {
-    let mut blockchain = Blockchain::new();
-    let mut rng = OsRng;
-
-    // Create some keypairs for demonstration
-    let alice = Keypair::generate(&mut rng);
-    let bob = Keypair::generate(&mut rng);
-
-    // Create and add a transaction
-    let tx = Transaction::new(
-        alice.public,
-        bob.public,
-        50,
-        &alice,
-    );
-    blockchain.add_transaction(tx);
-
-    // Mine a block
-    let miner_pubkey = base64_encode(alice.public.as_bytes());
-    blockchain.mine_pending_transactions(&miner_pubkey);
-
-    // Show blockchain
-    println!("{:#?}", blockchain.chain);
-
-    // Check balances
-    println!("Alice balance: {}", blockchain.get_balance(&base64_encode(alice.public.as_bytes())));
-    println!("Bob balance: {}", blockchain.get_balance(&base64_encode(bob.public.as_bytes())));
+    Ok(())
 }
