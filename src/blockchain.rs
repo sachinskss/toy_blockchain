@@ -1,12 +1,19 @@
+use std::collections::HashMap;
+
+use anyhow::{Result, anyhow};
+use chrono::Utc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use chrono::Utc;
-use crate::transaction::{Transaction, OutPoint, TxOut};
-use crate::merkle::calculate_merkle_root;
+
 use crate::error::BlockchainError;
-use anyhow::Result;
-use std::collections::HashMap;
 use crate::mempool::Mempool;
+use crate::merkle::calculate_merkle_root;
+use crate::transaction::{OutPoint, Transaction, TxOut};
+
+const BLOCKS_TREE: &str = "blocks";
+const UTXO_TREE: &str = "utxo_set";
+const DEFAULT_DIFFICULTY_PREFIX: &str = "0000";
+const BLOCK_REWARD: u64 = 50;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Block {
@@ -20,19 +27,14 @@ pub struct Block {
 }
 
 impl Block {
-    pub fn new(index: u64, transactions: Vec<Transaction>, previous_hash: String) -> Self {
+    pub fn new(
+        index: u64,
+        transactions: Vec<Transaction>,
+        previous_hash: String,
+        difficulty_prefix: &str,
+    ) -> Result<Self> {
         let timestamp = Utc::now().timestamp();
-        let hashes: Vec<[u8; 32]> = transactions
-            .iter()
-            .map(|tx| {
-                let mut h = [0u8; 32];
-                let id = tx.id();
-                let bytes = hex::decode(id).unwrap_or_default();
-                h.copy_from_slice(&bytes);
-                h
-            })
-            .collect();
-        let merkle_root = calculate_merkle_root(hashes);
+        let merkle_root = Self::merkle_root_for_transactions(&transactions)?;
         let mut block = Block {
             index,
             timestamp,
@@ -42,8 +44,21 @@ impl Block {
             nonce: 0,
             hash: String::new(),
         };
-        block.mine_block();
-        block
+        block.mine_block(difficulty_prefix);
+        Ok(block)
+    }
+
+    pub fn merkle_root_for_transactions(transactions: &[Transaction]) -> Result<String> {
+        let mut hashes = Vec::with_capacity(transactions.len());
+        for tx in transactions {
+            let bytes = hex::decode(tx.id())
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            let digest: [u8; 32] = bytes
+                .try_into()
+                .map_err(|_| anyhow!(BlockchainError::SerializationError("invalid txid length".into())))?;
+            hashes.push(digest);
+        }
+        Ok(calculate_merkle_root(hashes))
     }
 
     pub fn calculate_hash(&self) -> String {
@@ -56,141 +71,159 @@ impl Block {
         hex::encode(hasher.finalize())
     }
 
-    pub fn mine_block(&mut self) {
-        let target = "0000"; // Difficulty
-        while !self.calculate_hash().starts_with(target) {
+    pub fn mine_block(&mut self, difficulty_prefix: &str) {
+        loop {
+            let hash = self.calculate_hash();
+            if hash.starts_with(difficulty_prefix) {
+                self.hash = hash;
+                break;
+            }
             self.nonce += 1;
         }
-        self.hash = self.calculate_hash();
+    }
+
+    pub fn validate_pow(&self, difficulty_prefix: &str) -> Result<()> {
+        let expected_hash = self.calculate_hash();
+        if self.hash != expected_hash {
+            return Err(anyhow!(BlockchainError::InvalidBlockHash));
+        }
+        if !self.hash.starts_with(difficulty_prefix) {
+            return Err(anyhow!(BlockchainError::PoWNotMet));
+        }
+        Ok(())
+    }
+
+    pub fn validate_merkle_root(&self) -> Result<()> {
+        let expected = Self::merkle_root_for_transactions(&self.transactions)?;
+        if expected != self.merkle_root {
+            return Err(anyhow!(BlockchainError::InvalidMerkleRoot));
+        }
+        Ok(())
     }
 }
 
+#[derive(Debug)]
 pub struct Blockchain {
     pub chain: Vec<Block>,
     pub utxo_set: HashMap<OutPoint, TxOut>,
     pub mempool: Mempool,
     pub db: sled::Db,
+    pub difficulty_prefix: String,
 }
 
 impl Blockchain {
     pub fn open(db_path: &str) -> Result<Self> {
-        let db = sled::open(db_path)?;
+        let db = sled::open(db_path)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        let blocks_tree = db
+            .open_tree(BLOCKS_TREE)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+
         let mut chain = Vec::new();
-        let utxo_tree = db.open_tree("utxo_set")?;
-        let mut utxo_set = HashMap::new();
-
-        // Load UTXO set from DB
-        for item in utxo_tree.iter() {
-            let (key, value) = item?;
-            let outpoint: OutPoint = bincode::deserialize(&key)?;
-            let txout: TxOut = bincode::deserialize(&value)?;
-            utxo_set.insert(outpoint, txout);
-        }
-
-
-        let mut i = 0;
-        while let Some(bytes) = db.get(format!("block_{}", i))? {
-            let block: Block = bincode::deserialize(&bytes)?;
-            Self::update_utxo_set(&mut utxo_set, &block.transactions);
+        for item in blocks_tree.iter() {
+            let (_, value) = item.map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+            let block: Block = bincode::deserialize(&value)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
             chain.push(block);
-            i += 1;
         }
+
+        let difficulty_prefix = DEFAULT_DIFFICULTY_PREFIX.to_string();
 
         if chain.is_empty() {
-            let genesis = Block::new(0, vec![], "0".repeat(64));
-            let bytes = bincode::serialize(&genesis)?;
-            db.insert("block_0", bytes)?;
-            Self::update_utxo_set(&mut utxo_set, &genesis.transactions);
+            let genesis = Block::new(0, Vec::new(), "0".repeat(64), &difficulty_prefix)?;
+            let bytes = bincode::serialize(&genesis)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            blocks_tree
+                .insert(genesis.index.to_be_bytes(), bytes)
+                .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
             chain.push(genesis);
-            // Save initial UTXO set
-            for (outpoint, txout) in &utxo_set {
-                utxo_tree.insert(bincode::serialize(outpoint)?, bincode::serialize(txout)?)?;
-            }
+            db.flush()
+                .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
         }
 
-        Ok(Blockchain {
+        let utxo_set = Self::rebuild_utxo_set(&chain)?;
+        let blockchain = Blockchain {
             chain,
             utxo_set,
             mempool: Mempool::new(),
             db,
-        })
+            difficulty_prefix,
+        };
+        blockchain.persist_utxo_set()?;
+        Ok(blockchain)
     }
 
-    fn update_utxo_set(utxo_set: &mut HashMap<OutPoint, TxOut>, transactions: &[Transaction]) {
-        for tx in transactions {
-            let txid = tx.id();
-            for input in &tx.inputs {
-                utxo_set.remove(&input.prev_out);
-            }
-            for (i, output) in tx.outputs.iter().enumerate() {
-                utxo_set.insert(
-                    OutPoint {
-                        txid: txid.clone(),
-                        index: i as u32,
-                    },
-                    output.clone(),
-                );
-            }
+    pub fn difficulty_prefix(&self) -> &str {
+        &self.difficulty_prefix
+    }
+
+    pub fn tip_hash(&self) -> Result<String> {
+        self.chain
+            .last()
+            .map(|block| block.hash.clone())
+            .ok_or_else(|| anyhow!(BlockchainError::MissingData("chain tip")))
+    }
+
+    pub fn add_to_mempool(&mut self, tx: Transaction) -> Result<String> {
+        self.validate_transaction_against_state(&tx, &self.utxo_set)?;
+        let txid = tx.id();
+        if self.mempool.contains(&txid) {
+            return Ok(txid);
         }
+        Ok(self.mempool.add_transaction(tx))
     }
 
-    pub fn add_to_mempool(&mut self, tx: Transaction) -> Result<()> {
-        // Verify transaction before adding to mempool
-        tx.verify(&self.utxo_set)?;
-        self.mempool.add_transaction(tx);
+    pub fn add_block(&mut self, block: Block) -> Result<()> {
+        let (mut candidate_utxo, tx_ids) = self.validate_candidate_block(&block)?;
+        self.persist_block(&block)?;
+        self.chain.push(block);
+        self.utxo_set = std::mem::take(&mut candidate_utxo);
+        self.persist_utxo_set()?;
+        self.mempool.remove_transactions(&tx_ids);
         Ok(())
     }
 
     pub fn replace_chain(&mut self, new_chain: Vec<Block>) -> Result<()> {
-        // Simple longest chain rule: replace if new chain is longer and valid
-        if new_chain.len() > self.chain.len() {
-            // Re-initialize UTXO set and apply blocks from new chain
-            self.utxo_set.clear();
-            let utxo_tree = self.db.open_tree("utxo_set")?;
-            utxo_tree.clear()?;
-
-            // Clear existing blocks in DB
-            for i in 0..self.chain.len() {
-                self.db.remove(format!("block_{}", i))?;
-            }
-
-            self.chain.clear();
-            for block in new_chain {
-                self._apply_block(block)?;
-            }
-            Ok(())
-        } else {
-            Err(BlockchainError::InvalidPreviousHash.into()) // Placeholder error, refine later
-        }
-    }
-
-    pub fn add_block(&mut self, block: Block) -> Result<()> {
-        if block.previous_hash != self.chain.last().unwrap().hash {
-            return Err(BlockchainError::InvalidPreviousHash.into());
-        }
-        if !block.hash.starts_with("0000") {
-            return Err(BlockchainError::PoWNotMet.into());
-        }
-        self._apply_block(block)
-    }
-
-    // Internal function to apply a block to the chain and update UTXO set
-    pub fn _apply_block(&mut self, block: Block) -> Result<()> {
-
-
-        Self::update_utxo_set(&mut self.utxo_set, &block.transactions);
-
-        // Update UTXO set in DB
-        let utxo_tree = self.db.open_tree("utxo_set")?;
-        utxo_tree.clear()?;
-        for (outpoint, txout) in &self.utxo_set {
-            utxo_tree.insert(bincode::serialize(outpoint)?, bincode::serialize(txout)?)?;
+        if new_chain.len() <= self.chain.len() {
+            return Err(anyhow!(BlockchainError::ChainReplacementRejected));
         }
 
-        let bytes = bincode::serialize(&block)?;
-        self.db.insert(format!("block_{}", block.index), bytes)?;
-        self.chain.push(block);
+        let new_utxo = self.validate_chain(&new_chain)?;
+        self.overwrite_chain(&new_chain, &new_utxo)?;
+        self.chain = new_chain;
+        self.utxo_set = new_utxo;
+        self.retain_valid_mempool()?;
         Ok(())
+    }
+
+    pub fn mine_block_from_mempool(&mut self, miner_address: String) -> Result<Block> {
+        let mut transactions = Vec::new();
+        transactions.push(Transaction {
+            inputs: Vec::new(),
+            outputs: vec![TxOut {
+                value: BLOCK_REWARD,
+                address: miner_address,
+            }],
+            timestamp: Utc::now().timestamp(),
+        });
+
+        let mut staged_utxo = self.utxo_set.clone();
+        for tx in self.mempool.get_transactions_for_block(100) {
+            if self.validate_transaction_against_state(&tx, &staged_utxo).is_ok() {
+                Self::apply_transactions_to_utxo(&mut staged_utxo, std::slice::from_ref(&tx));
+                transactions.push(tx);
+            }
+        }
+
+        let previous_hash = self.tip_hash()?;
+        let block = Block::new(
+            self.chain.len() as u64,
+            transactions,
+            previous_hash,
+            &self.difficulty_prefix,
+        )?;
+        self.add_block(block.clone())?;
+        Ok(block)
     }
 
     pub fn get_balance(&self, address: &str) -> u64 {
@@ -201,15 +234,294 @@ impl Blockchain {
             .sum()
     }
 
-    pub fn mine_block_from_mempool(&mut self, miner_address: String) -> Result<Block> {
-        let transactions: Vec<Transaction> = self.mempool.get_transactions_for_block(10).into_iter().collect(); // Take up to 10 transactions
-        let previous_hash = self.chain.last().unwrap().hash.clone();
-        let new_block = Block::new(self.chain.len() as u64, transactions.clone(), previous_hash);
-        self.add_block(new_block.clone())?;
+    pub fn validate_chain(&self, chain: &[Block]) -> Result<HashMap<OutPoint, TxOut>> {
+        if chain.is_empty() {
+            return Err(anyhow!(BlockchainError::MissingData("chain")));
+        }
 
-        let tx_ids: Vec<String> = transactions.iter().map(|tx| tx.id()).collect();
-        self.mempool.remove_transactions(&tx_ids);
+        if chain[0].previous_hash != "0".repeat(64) {
+            return Err(anyhow!(BlockchainError::GenesisMismatch));
+        }
 
-        Ok(new_block)
+        let mut utxo = HashMap::new();
+        let mut expected_index = 0u64;
+        let mut previous_hash = String::new();
+
+        for (position, block) in chain.iter().enumerate() {
+            if block.index != expected_index {
+                return Err(anyhow!(BlockchainError::InvalidBlockHash));
+            }
+            if position > 0 && block.previous_hash != previous_hash {
+                return Err(anyhow!(BlockchainError::InvalidPreviousHash));
+            }
+            block.validate_pow(&self.difficulty_prefix)?;
+            block.validate_merkle_root()?;
+            Self::validate_transactions_for_block(&block.transactions, &mut utxo)?;
+            previous_hash = block.hash.clone();
+            expected_index += 1;
+        }
+
+        Ok(utxo)
+    }
+
+    fn validate_candidate_block(
+        &self,
+        block: &Block,
+    ) -> Result<(HashMap<OutPoint, TxOut>, Vec<String>)> {
+        let expected_previous_hash = self.tip_hash()?;
+        if block.previous_hash != expected_previous_hash {
+            return Err(anyhow!(BlockchainError::InvalidPreviousHash));
+        }
+        if block.index != self.chain.len() as u64 {
+            return Err(anyhow!(BlockchainError::InvalidBlockHash));
+        }
+        block.validate_pow(&self.difficulty_prefix)?;
+        block.validate_merkle_root()?;
+
+        let mut candidate_utxo = self.utxo_set.clone();
+        Self::validate_transactions_for_block(&block.transactions, &mut candidate_utxo)?;
+        let tx_ids = block.transactions.iter().map(Transaction::id).collect();
+        Ok((candidate_utxo, tx_ids))
+    }
+
+    fn validate_transactions_for_block(
+        transactions: &[Transaction],
+        utxo_set: &mut HashMap<OutPoint, TxOut>,
+    ) -> Result<()> {
+        let mut coinbase_seen = false;
+        for tx in transactions {
+            if tx.is_coinbase() {
+                if coinbase_seen {
+                    return Err(anyhow!(BlockchainError::InvalidTransaction));
+                }
+                coinbase_seen = true;
+            } else {
+                tx.verify(utxo_set)?;
+            }
+            Self::apply_transactions_to_utxo(utxo_set, std::slice::from_ref(tx));
+        }
+        Ok(())
+    }
+
+    fn validate_transaction_against_state(
+        &self,
+        tx: &Transaction,
+        utxo_state: &HashMap<OutPoint, TxOut>,
+    ) -> Result<()> {
+        tx.verify(utxo_state)?;
+        Ok(())
+    }
+
+    fn apply_transactions_to_utxo(
+        utxo_set: &mut HashMap<OutPoint, TxOut>,
+        transactions: &[Transaction],
+    ) {
+        for tx in transactions {
+            let txid = tx.id();
+            for input in &tx.inputs {
+                utxo_set.remove(&input.prev_out);
+            }
+            for (index, output) in tx.outputs.iter().enumerate() {
+                utxo_set.insert(
+                    OutPoint {
+                        txid: txid.clone(),
+                        index: index as u32,
+                    },
+                    output.clone(),
+                );
+            }
+        }
+    }
+
+    fn rebuild_utxo_set(chain: &[Block]) -> Result<HashMap<OutPoint, TxOut>> {
+        let mut utxo = HashMap::new();
+        for block in chain {
+            Self::validate_transactions_for_block(&block.transactions, &mut utxo)?;
+        }
+        Ok(utxo)
+    }
+
+    fn persist_block(&self, block: &Block) -> Result<()> {
+        let tree = self
+            .db
+            .open_tree(BLOCKS_TREE)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        let bytes = bincode::serialize(block)
+            .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+        tree.insert(block.index.to_be_bytes(), bytes)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        self.db
+            .flush()
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        Ok(())
+    }
+
+    fn persist_utxo_set(&self) -> Result<()> {
+        let tree = self
+            .db
+            .open_tree(UTXO_TREE)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        tree.clear()
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        for (outpoint, txout) in &self.utxo_set {
+            let key = bincode::serialize(outpoint)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            let value = bincode::serialize(txout)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            tree.insert(key, value)
+                .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        }
+        self.db
+            .flush()
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        Ok(())
+    }
+
+    fn overwrite_chain(
+        &self,
+        new_chain: &[Block],
+        new_utxo: &HashMap<OutPoint, TxOut>,
+    ) -> Result<()> {
+        let blocks_tree = self
+            .db
+            .open_tree(BLOCKS_TREE)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        blocks_tree
+            .clear()
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        for block in new_chain {
+            let bytes = bincode::serialize(block)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            blocks_tree
+                .insert(block.index.to_be_bytes(), bytes)
+                .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        }
+
+        let utxo_tree = self
+            .db
+            .open_tree(UTXO_TREE)
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        utxo_tree
+            .clear()
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        for (outpoint, txout) in new_utxo {
+            let key = bincode::serialize(outpoint)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            let value = bincode::serialize(txout)
+                .map_err(|e| anyhow!(BlockchainError::SerializationError(e.to_string())))?;
+            utxo_tree
+                .insert(key, value)
+                .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        }
+
+        self.db
+            .flush()
+            .map_err(|e| anyhow!(BlockchainError::StorageError(e.to_string())))?;
+        Ok(())
+    }
+
+    fn retain_valid_mempool(&mut self) -> Result<()> {
+        let current = self.mempool.all();
+        self.mempool = Mempool::new();
+        for tx in current {
+            if self.validate_transaction_against_state(&tx, &self.utxo_set).is_ok() {
+                self.mempool.add_transaction(tx);
+            }
+        }
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::transaction::{OutPoint, Transaction, TxIn, TxOut};
+
+    #[test]
+    fn merkle_root_for_empty_transactions_is_zero_hash() {
+        let root = Block::merkle_root_for_transactions(&[]).unwrap();
+        assert_eq!(root, hex::encode([0u8; 32]));
+    }
+
+    #[test]
+    fn mempool_add_contains_and_remove_work() {
+        let mut mempool = Mempool::new();
+        let tx = Transaction {
+            inputs: vec![],
+            outputs: vec![TxOut {
+                value: 10,
+                address: "miner".to_string(),
+            }],
+            timestamp: 1,
+        };
+        let txid = mempool.add_transaction(tx.clone());
+        assert!(mempool.contains(&txid));
+        assert_eq!(mempool.all().len(), 1);
+        mempool.remove_transactions(&[txid.clone()]);
+        assert!(!mempool.contains(&txid));
+        assert!(mempool.all().is_empty());
+    }
+
+    #[test]
+    fn coinbase_transaction_is_valid_without_inputs() {
+        let tx = Transaction {
+            inputs: vec![],
+            outputs: vec![TxOut {
+                value: 50,
+                address: "miner".to_string(),
+            }],
+            timestamp: 1,
+        };
+
+        assert!(tx.verify(&HashMap::new()).is_ok());
+    }
+
+    #[test]
+    fn transaction_verify_rejects_malformed_signature_format() {
+        let tx = Transaction {
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: "a".repeat(64),
+                    index: 0,
+                },
+                signature: "not-hex".to_string(),
+            }],
+            outputs: vec![TxOut {
+                value: 5,
+                address: "miner".to_string(),
+            }],
+            timestamp: 1,
+        };
+
+        let mut utxo = HashMap::new();
+        utxo.insert(
+            tx.inputs[0].prev_out.clone(),
+            TxOut {
+                value: 5,
+                address: "miner".to_string(),
+            },
+        );
+
+        assert!(tx.verify(&utxo).is_err());
+    }
+
+    #[test]
+    fn transaction_verify_rejects_unknown_input() {
+        let tx = Transaction {
+            inputs: vec![TxIn {
+                prev_out: OutPoint {
+                    txid: "b".repeat(64),
+                    index: 0,
+                },
+                signature: "00".repeat(32),
+            }],
+            outputs: vec![TxOut {
+                value: 5,
+                address: "miner".to_string(),
+            }],
+            timestamp: 1,
+        };
+
+        assert!(tx.verify(&HashMap::new()).is_err());
     }
 }

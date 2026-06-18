@@ -2,24 +2,36 @@ use thiserror::Error;
 
 #[derive(Error, Debug)]
 pub enum BlockchainError {
-    #[error("Invalid transaction signature")]
+    #[error("invalid transaction signature")]
     InvalidSignature,
-    #[error("Insufficient balance")]
+    #[error("insufficient balance")]
     InsufficientBalance,
-    #[error("Invalid block hash")]
+    #[error("invalid block hash")]
     InvalidBlockHash,
-    #[error("Invalid previous hash")]
+    #[error("invalid previous hash")]
     InvalidPreviousHash,
-    #[error("Proof of work not met")]
+    #[error("proof of work not met")]
     PoWNotMet,
-    #[error("Serialization error: {0}")]
-    SerializationError(String),
-    #[error("Storage error: {0}")]
-    StorageError(String),
-    #[error("Input UTXO not found")]
+    #[error("input UTXO not found")]
     InputNotFound,
-    #[error("Invalid public key")]
+    #[error("invalid public key")]
     InvalidPublicKey,
-    #[error("Invalid signature format")]
+    #[error("invalid signature format")]
     InvalidSignatureFormat,
+    #[error("invalid merkle root")]
+    InvalidMerkleRoot,
+    #[error("block contains invalid transaction")]
+    InvalidTransaction,
+    #[error("duplicate transaction input detected")]
+    DuplicateInput,
+    #[error("chain replacement rejected")]
+    ChainReplacementRejected,
+    #[error("genesis block mismatch")]
+    GenesisMismatch,
+    #[error("database entry missing: {0}")]
+    MissingData(&'static str),
+    #[error("serialization error: {0}")]
+    SerializationError(String),
+    #[error("storage error: {0}")]
+    StorageError(String),
 }

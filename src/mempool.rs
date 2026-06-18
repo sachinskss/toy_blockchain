@@ -1,19 +1,29 @@
 use std::collections::HashMap;
+
 use crate::transaction::Transaction;
 
+#[derive(Debug, Default)]
 pub struct Mempool {
     pub transactions: HashMap<String, Transaction>,
 }
 
 impl Mempool {
     pub fn new() -> Self {
-        Mempool {
-            transactions: HashMap::new(),
-        }
+        Self::default()
     }
 
-    pub fn add_transaction(&mut self, tx: Transaction) {
-        self.transactions.insert(tx.id(), tx);
+    pub fn add_transaction(&mut self, tx: Transaction) -> String {
+        let txid = tx.id();
+        self.transactions.insert(txid.clone(), tx);
+        txid
+    }
+
+    pub fn contains(&self, txid: &str) -> bool {
+        self.transactions.contains_key(txid)
+    }
+
+    pub fn all(&self) -> Vec<Transaction> {
+        self.transactions.values().cloned().collect()
     }
 
     pub fn get_transactions_for_block(&self, count: usize) -> Vec<Transaction> {
@@ -24,13 +34,5 @@ impl Mempool {
         for tx_id in tx_ids {
             self.transactions.remove(tx_id);
         }
-    }
-
-    pub fn len(&self) -> usize {
-        self.transactions.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.transactions.is_empty()
     }
 }
