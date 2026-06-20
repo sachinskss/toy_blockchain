@@ -1,0 +1,23 @@
+{
+  "note": "Example persisted blockchain state used for demo/testing.",
+  "sample_blocks": [
+    {
+      "index": 0,
+      "transactions": [],
+      "previous_hash": "0".repeat(64),
+      "description": "Genesis block"
+    }
+  ],
+  "sample_utxos": [
+    {
+      "outpoint": {
+        "txid": "sample-genesis-tx",
+        "index": 0
+      },
+      "txout": {
+        "value": 50,
+        "address": "demo-address"
+      }
+    }
+  ]
+}

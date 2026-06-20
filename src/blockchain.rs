@@ -624,4 +624,32 @@ mod tests {
         assert_eq!(selected.len(), 2);
         assert_eq!(selected.iter().map(|(_, out)| out.value).sum::<u64>(), 35);
     }
+
+    #[test]
+    fn example_seed_file_is_present_and_readable() {
+        let path = std::path::Path::new("blockchain_db/example_seed.json");
+        assert!(path.exists());
+        let contents = std::fs::read_to_string(path).unwrap();
+        assert!(contents.contains("Example persisted blockchain state"));
+        assert!(contents.contains("sample_utxos"));
+    }
+
+    #[test]
+    fn empty_blockchain_open_creates_genesis_block() {
+        let unique = format!(
+            "toy_blockchain_genesis_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&path);
+
+        let blockchain = Blockchain::open(path.to_str().unwrap()).unwrap();
+        assert_eq!(blockchain.chain.len(), 1);
+        assert_eq!(blockchain.chain[0].index, 0);
+        assert_eq!(blockchain.chain[0].transactions.len(), 0);
+    }
 }
