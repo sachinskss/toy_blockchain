@@ -234,6 +234,37 @@ impl Blockchain {
             .sum()
     }
 
+    pub fn select_utxos_for_amount(
+        &self,
+        address: &str,
+        amount: u64,
+    ) -> Option<Vec<(OutPoint, TxOut)>> {
+        let mut selected = self
+            .utxo_set
+            .iter()
+            .filter(|(_, output)| output.address == address)
+            .map(|(outpoint, output)| (outpoint.clone(), output.clone()))
+            .collect::<Vec<_>>();
+
+        selected.sort_by(|a, b| {
+            a.0.txid
+                .cmp(&b.0.txid)
+                .then_with(|| a.0.index.cmp(&b.0.index))
+        });
+
+        let mut total = 0u64;
+        let mut chosen = Vec::new();
+        for (outpoint, output) in selected {
+            total = total.checked_add(output.value)?;
+            chosen.push((outpoint, output));
+            if total >= amount {
+                return Some(chosen);
+            }
+        }
+
+        None
+    }
+
     pub fn validate_chain(&self, chain: &[Block]) -> Result<HashMap<OutPoint, TxOut>> {
         if chain.is_empty() {
             return Err(anyhow!(BlockchainError::MissingData("chain")));
@@ -437,6 +468,27 @@ mod tests {
     use super::*;
     use crate::transaction::{OutPoint, Transaction, TxIn, TxOut};
 
+    fn build_test_blockchain(utxo_set: HashMap<OutPoint, TxOut>) -> Blockchain {
+        let unique = format!(
+            "toy_blockchain_test_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let path = std::env::temp_dir().join(unique);
+        let _ = std::fs::remove_dir_all(&path);
+        let db = sled::open(&path).unwrap();
+        Blockchain {
+            chain: Vec::new(),
+            utxo_set,
+            mempool: Mempool::new(),
+            db,
+            difficulty_prefix: DEFAULT_DIFFICULTY_PREFIX.to_string(),
+        }
+    }
+
     #[test]
     fn merkle_root_for_empty_transactions_is_zero_hash() {
         let root = Block::merkle_root_for_transactions(&[]).unwrap();
@@ -523,5 +575,53 @@ mod tests {
         };
 
         assert!(tx.verify(&HashMap::new()).is_err());
+    }
+
+    #[test]
+    fn select_utxos_for_amount_returns_none_when_insufficient_funds() {
+        let mut utxo = HashMap::new();
+        utxo.insert(
+            OutPoint {
+                txid: "tx1".to_string(),
+                index: 0,
+            },
+            TxOut {
+                value: 10,
+                address: "alice".to_string(),
+            },
+        );
+
+        let blockchain = build_test_blockchain(utxo);
+        assert!(blockchain.select_utxos_for_amount("alice", 50).is_none());
+    }
+
+    #[test]
+    fn select_utxos_for_amount_can_select_multiple_utxos() {
+        let mut utxo = HashMap::new();
+        utxo.insert(
+            OutPoint {
+                txid: "tx1".to_string(),
+                index: 0,
+            },
+            TxOut {
+                value: 20,
+                address: "alice".to_string(),
+            },
+        );
+        utxo.insert(
+            OutPoint {
+                txid: "tx2".to_string(),
+                index: 0,
+            },
+            TxOut {
+                value: 15,
+                address: "alice".to_string(),
+            },
+        );
+
+        let blockchain = build_test_blockchain(utxo);
+        let selected = blockchain.select_utxos_for_amount("alice", 25).unwrap();
+        assert_eq!(selected.len(), 2);
+        assert_eq!(selected.iter().map(|(_, out)| out.value).sum::<u64>(), 35);
     }
 }

@@ -19,4 +19,5 @@ thiserror = "1.0"
 anyhow = "1.0"
 merkle_light = "0.4"
 tower-http = { version = "0.5", features = ["cors"] }
+tower = { version = "0.5", features = ["util"] }
 bincode = "1.3"
